@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import operator
 import random
@@ -17,7 +18,13 @@ from sglang.srt.constrained.base_grammar_backend import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_buffer,
+    get_exec,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
@@ -37,6 +44,36 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Finite rather than -inf: exp() underflows to exactly zero, so a suppressed token
+# is never sampled, but a row whose grammar admits only suppressed tokens stays finite.
+_SUPPRESS_TOKEN_BIAS = -1e4
+
+
+def _suppress_token_bias_row(vocab_size: int, device: str) -> Optional[torch.Tensor]:
+    """Process-cached [1, vocab] bias row for --suppress-token-ids-file; read-only."""
+    path = get_exec().features.suppress_token_ids_file
+    if not path:
+        return None
+
+    def build() -> torch.Tensor:
+        with open(path) as f:
+            token_ids = json.load(f)
+        in_range = [i for i in token_ids if 0 <= i < vocab_size]
+        row = torch.zeros(1, vocab_size, device=device)
+        row[0, torch.tensor(in_range, dtype=torch.long, device=device)] = (
+            _SUPPRESS_TOKEN_BIAS
+        )
+        logger.info(
+            "Suppressing %d token ids from sampling (%d of %d in vocab range) from %s",
+            len(token_ids),
+            len(in_range),
+            vocab_size,
+            path,
+        )
+        return row
+
+    return get_buffer(f"suppress_token_bias:{device}:{vocab_size}", build)
 
 
 def _rows_to_device_indices(
@@ -249,6 +286,9 @@ class SamplingBatchInfo:
                 device, non_blocking=True
             )
 
+        # Folded into logit_bias so every path that honors it (decode, grammar,
+        # speculative verify) suppresses the tokens without its own hook.
+        suppress_row = _suppress_token_bias_row(vocab_size=vocab_size, device=device)
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
             logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
@@ -272,6 +312,10 @@ class SamplingBatchInfo:
                 ] = torch.tensor(vals, dtype=logit_bias.dtype, pin_memory=_pin).to(
                     device, non_blocking=True
                 )
+            if suppress_row is not None:
+                logit_bias += suppress_row
+        elif suppress_row is not None:
+            logit_bias = suppress_row.expand(len(reqs), vocab_size)
 
         # Check if any request has custom logit processor
         enable_custom_processor = get_exec().features.enable_custom_logit_processor

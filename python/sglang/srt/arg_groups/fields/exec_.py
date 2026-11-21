@@ -87,6 +87,14 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Enable users to pass custom logit processors to the server (disabled by default for security)",
     ] = False
+    suppress_token_ids_file: A[
+        Optional[str],
+        "Path to a JSON file holding a list of token ids that are never sampled, "
+        "applied to every request as a large negative logit bias. Use it to keep a "
+        "script out of the output entirely (e.g. a CJK token set built by "
+        "tools/build_cjk_ban.py). Combines additively with a request's own "
+        "logit_bias.",
+    ] = None
     enable_watermark: A[
         bool,
         "Enable text watermarking with the algorithm --watermark-algorithm selects.",
